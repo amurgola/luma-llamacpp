@@ -23,7 +23,9 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: '12.4.1'
+          # 12.8 is the first toolkit that knows Blackwell (compute_120);
+          # 12.4 fails with "Unsupported gpu architecture 'compute_120'".
+          cuda: '12.8.1'
           method: network
           sub-packages: '["nvcc","cudart","cublas","cublas_dev","thrust","visual_studio_integration"]'
 
