@@ -1,0 +1,49 @@
+From 109e73d425c5098f87392649a600b19eed83003a Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Thu, 3 Sep 2026 17:38:28 -0400
+Subject: [PATCH 2/2] model-loader: split mmap staging copies across two
+ threads
+
+The staged-upload loop for mmap sources is bounded by a single-threaded
+memcpy out of the mapping; dual half-chunk copies raise effective source
+bandwidth. Small chunks (<8MB) keep the single copy.
+
+Measured (same setup as the previous commit): 4.7s -> ~4.5s
+load-to-healthy; bounded by prefault/memcpy contention on the memory
+subsystem rather than the copy itself beyond that.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TRNybKMfE2D3yiS9yXLBfe
+---
+ src/llama-model-loader.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 6d5a6ab..220f2a0 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1736,7 +1736,20 @@ bool llama_model_loader::load_all_data(
+                     // Wait for the previous upload to complete before reusing the buffer
+                     ggml_backend_event_synchronize(events[buffer_idx]);
+ 
+-                    memcpy(host_ptrs[buffer_idx], data + data_done, chunk);
++                    // Split the staging copy across two threads: a single
++                    // memcpy from the mapping tops out well below what dual
++                    // threads reach on DDR5, and the copy - not the DMA - is
++                    // this loop's bottleneck.
++                    if (chunk >= 8u * 1024 * 1024) {
++                        const size_t half = chunk / 2;
++                        auto upper = std::async(std::launch::async, [&]() {
++                            memcpy((uint8_t *) host_ptrs[buffer_idx] + half, data + data_done + half, chunk - half);
++                        });
++                        memcpy(host_ptrs[buffer_idx], data + data_done, half);
++                        upper.get();
++                    } else {
++                        memcpy(host_ptrs[buffer_idx], data + data_done, chunk);
++                    }
+ 
+                     ggml_backend_tensor_set_async(upload_backend, cur,
+                                                   host_ptrs[buffer_idx], data_done, chunk);
+-- 
+2.53.0.windows.2
+
