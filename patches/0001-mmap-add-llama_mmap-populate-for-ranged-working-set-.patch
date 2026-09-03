@@ -1,0 +1,116 @@
+From 1544a043c17fb7f380ca5a14b18761aee609e96d Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Thu, 3 Sep 2026 16:17:26 -0400
+Subject: [PATCH 1/2] mmap: add llama_mmap::populate() for ranged working-set
+ population
+
+Best-effort, thread-safe API to bring a [first, last) byte range of the
+mapping into the process working set: ranged PrefetchVirtualMemory on
+Windows, madvise(WILLNEED) on POSIX, no-op elsewhere.
+
+Motivation: the whole-file PrefetchVirtualMemory issued at map time is
+only a hint and does not guarantee working-set insertion - readers still
+soft-fault page by page (measured ~2-3 GB/s on one thread on Windows
+even with the file fully in page cache). Ranged population lets loaders
+wire exactly what they are about to read, from as many threads as the
+fault path can use.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TRNybKMfE2D3yiS9yXLBfe
+---
+ src/llama-mmap.cpp | 40 ++++++++++++++++++++++++++++++++++++++++
+ src/llama-mmap.h   |  6 ++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 4d183cb..f45de87 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -514,6 +514,17 @@ struct llama_mmap::impl {
+         mapped_fragments.emplace_back(0, file->size());
+     }
+ 
++    void populate(size_t first, size_t last) const {
++        const size_t page_size = sysconf(_SC_PAGESIZE);
++        size_t beg = first & ~(page_size - 1);
++        size_t end = std::min((last + page_size - 1) & ~(page_size - 1), size);
++        if (beg >= end) {
++            return;
++        }
++        // best effort — a failure just means the reader soft-faults instead
++        posix_madvise((char *) addr + beg, end - beg, POSIX_MADV_WILLNEED);
++    }
++
+     static void align_range(size_t * first, size_t * last, size_t page_size) {
+         size_t offset_in_page = *first & (page_size - 1);
+         size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
+@@ -621,6 +632,29 @@ struct llama_mmap::impl {
+         }
+     }
+ 
++    void populate(size_t first, size_t last) const {
++#if _WIN32_WINNT >= 0x602
++        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
++        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
++        pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
++        if (!pPrefetchVirtualMemory) {
++            return;
++        }
++        last = std::min(last, size);
++        if (last <= first) {
++            return;
++        }
++        WIN32_MEMORY_RANGE_ENTRY entry;
++        entry.VirtualAddress = (char *) addr + first;
++        entry.NumberOfBytes  = (SIZE_T) (last - first);
++        // best effort — a failure just means the reader soft-faults instead
++        pPrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
++#else
++        GGML_UNUSED(first);
++        GGML_UNUSED(last);
++#endif
++    }
++
+     void unmap_fragment(size_t first, size_t last) {
+         GGML_UNUSED(first);
+         GGML_UNUSED(last);
+@@ -656,6 +690,11 @@ struct llama_mmap::impl {
+ 
+         throw std::runtime_error("mmap not supported");
+     }
++
++    void populate(size_t first, size_t last) const {
++        GGML_UNUSED(first);
++        GGML_UNUSED(last);
++    }
+ #endif
+ 
+     void * addr;
+@@ -667,6 +706,7 @@ llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
+ llama_mmap::~llama_mmap() = default;
+ 
+ size_t llama_mmap::size() const { return pimpl->size; }
++void llama_mmap::populate(size_t first, size_t last) const { pimpl->populate(first, last); }
+ void * llama_mmap::addr() const { return pimpl->addr; }
+ 
+ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index cc28c8a..06a4ff7 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -53,6 +53,12 @@ struct llama_mmap {
+     size_t size() const;
+     void * addr() const;
+ 
++    // Best-effort: bring [first, last) into this process's working set so
++    // subsequent reads do not soft-fault page by page. Windows: ranged
++    // PrefetchVirtualMemory; POSIX: madvise(WILLNEED). Safe to call from
++    // multiple threads.
++    void populate(size_t first, size_t last) const;
++
+     void unmap_fragment(size_t first, size_t last);
+ 
+     static const bool SUPPORTED;
+-- 
+2.53.0.windows.2
+

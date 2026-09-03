@@ -1,0 +1,62 @@
+name: release
+
+# Tag `luma-b<upstream-build>.<n>` (or run manually) to build llama-server
+# with the patch stack applied and publish the two LumaBrowser-consumable
+# release assets. The CUDA kernel compile across three archs is slow on
+# hosted runners (~1-2h) — this is a per-release build, not per-push CI.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'luma-b*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.1'
+          method: network
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev","thrust","visual_studio_integration"]'
+
+      - name: Install ninja
+        run: choco install ninja -y
+
+      - name: Apply patch stack to pinned upstream
+        shell: pwsh
+        run: |
+          git config --global user.email "ci@lumabyte.com"
+          git config --global user.name "luma-llamacpp CI"
+          .\scripts\checkout.ps1
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne 'tag') { $tag = "manual-$($env:GITHUB_SHA.Substring(0,7))" }
+          .\scripts\build-windows-cuda.ps1 -Tag $tag -CudaPath $env:CUDA_PATH
+
+      - name: Upload artifacts (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*.zip
+
+      - name: Publish release (tags)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" (Get-ChildItem dist\*.zip).FullName `
+            --title "${{ github.ref_name }}" `
+            --notes "Patched llama.cpp build (upstream $(Get-Content UPSTREAM_REF)). See README for the patch stack."
