@@ -20,6 +20,7 @@ load-to-healthy time**. The patches here target it.
 |---|---|---|
 | 0001 | `llama_mmap::populate()` — ranged working-set population (PrefetchVirtualMemory / madvise) | upstream candidate |
 | 0002 | Async pinned-staging uploads + parallel prefault for mmap-sourced weights | upstream candidate |
+| 0003 | Persist context checkpoints in slot save/restore — makes `/slots/{id}?action=restore` actually resume SWA/hybrid-attention models across a restart (Qwen3.8 5.7k-token restore: 5774 reprocessed tokens → 4) | upstream candidate |
 
 Measured together on a 21.5 GiB Q6_K model (warm page cache, RTX 5090, Windows
 11): `--load-mode mmap` load-to-healthy 12.8s → **8.25s**, with the
