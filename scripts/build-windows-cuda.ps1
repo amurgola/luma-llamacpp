@@ -26,8 +26,13 @@ $vsroot = & $vswhere -products * -version '[17.0,18.0)' -requires Microsoft.Visu
 if (-not $vsroot) { throw 'No VS 2022 toolset with C++ tools found (vswhere).' }
 $vcvars = Join-Path $vsroot 'VC\Auxiliary\Build\vcvars64.bat'
 
+# LLAMA_OPENSSL must stay OFF: it defaults ON upstream, and GitHub's
+# windows runners ship OpenSSL 3, so CI builds silently dynamic-link the
+# runner's libssl/libcrypto DLLs — which aren't packaged, giving end users
+# STATUS_DLL_NOT_FOUND (0xC0000135). LumaBrowser never uses the server's
+# HTTPS downloader, so nothing is lost.
 $nvcc = Join-Path $CudaPath 'bin\nvcc.exe'
-cmd /c "call `"$vcvars`" >nul && cmake -S `"$work`" -B `"$work\build`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=`"$Archs`" -DLLAMA_CURL=OFF -DCMAKE_CUDA_COMPILER=`"$nvcc`" && ninja -C `"$work\build`" llama-server"
+cmd /c "call `"$vcvars`" >nul && cmake -S `"$work`" -B `"$work\build`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=`"$Archs`" -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DCMAKE_CUDA_COMPILER=`"$nvcc`" && ninja -C `"$work\build`" llama-server"
 if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
 New-Item -ItemType Directory -Force $dist | Out-Null
