@@ -20,9 +20,15 @@ load-to-healthy time**. The patches here target it.
 |---|---|---|
 | 0001 | `llama_mmap::populate()` — ranged working-set population (PrefetchVirtualMemory / madvise) | upstream candidate |
 | 0002 | Async pinned-staging uploads + parallel prefault for mmap-sourced weights | upstream candidate |
-| 0003 | Persist context checkpoints in slot save/restore — makes `/slots/{id}?action=restore` actually resume SWA/hybrid-attention models across a restart (Qwen3.8 5.7k-token restore: 5774 reprocessed tokens → 4) | upstream candidate |
-| 0004 | Overlap vocab construction with tensor loading (`n_vocab` pre-read from gguf metadata) — hides ~1.9s of 250k-vocab build behind the weight upload | upstream candidate |
-| 0005 | Dual-threaded mmap staging copies | upstream candidate |
+| 0003 | Overlap vocab construction with tensor loading (`n_vocab` and `n_token_types` pre-read from gguf metadata) — hides ~1.9s of 250k-vocab build behind the weight upload | upstream candidate |
+| 0004 | Dual-threaded mmap staging copies | upstream candidate |
+
+Landed upstream and dropped from the stack:
+
+- Persist context checkpoints in slot save/restore (was 0003) — upstream
+  ggml-org/llama.cpp#26004 stores them inside the slot file instead of a
+  sidecar. Verified on b11721: a 6087-token Qwen3.8 prompt reprocesses 4 tokens
+  after save → restart → restore. Old sidecar files are simply ignored.
 
 Measured together on a 21.5 GiB Q6_K model (warm page cache, RTX 5090, Windows
 11): `--load-mode mmap` load-to-healthy 12.8s → **8.25s**, with the
@@ -64,6 +70,11 @@ cudart-llama-bin-win-cuda-12.x-x64.zip    cudart/cublas runtime DLLs
 Pointing LumaBrowser at this feed is a one-line repo swap in the runtime
 catalog entry (or a data-only runtime row from an extension, the ik_llama
 pattern).
+
+Re-measured on the b11721 rebase (same model and machine, `--load-mode mmap
+--fit off`, sm_120 build, unpatched b11721 built with identical flags as the
+baseline): load-to-healthy **9.3s → 4.0s**, greedy completions and BERT
+embeddings byte-identical to the unpatched build.
 
 ## Syncing with upstream
 

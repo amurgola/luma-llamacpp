@@ -1,3 +1,4 @@
-# Patch files are byte-exact inputs to git am — never EOL-convert them.
-patches/** -text
 * text=auto
+# Patch files are byte-exact inputs to git am - never EOL-convert them. Must come after the
+# catch-all above: for the same path, the later line wins.
+patches/** -text

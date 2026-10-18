@@ -1,7 +1,7 @@
-From ecf159a61810a707dbb7df2146152d4a10071359 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Andrew Murgola <andy@murgo.la>
 Date: Thu, 3 Sep 2026 16:17:26 -0400
-Subject: [PATCH 2/2] model-loader: async staged uploads + parallel prefault
+Subject: [PATCH 2/4] model-loader: async staged uploads + parallel prefault
  for mmap sources
 
 The pinned-staging async upload pipeline previously refused mmap
@@ -31,11 +31,11 @@ profile (no transient heap copy of the weights).
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01TRNybKMfE2D3yiS9yXLBfe
 ---
- src/llama-model-loader.cpp | 95 ++++++++++++++++++++++++++++++++++++--
- 1 file changed, 91 insertions(+), 4 deletions(-)
+ src/llama-model-loader.cpp | 94 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 91 insertions(+), 3 deletions(-)
 
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 49f3c4f..6d5a6ab 100644
+index bc93c6f9e..32ce8fbd4 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -12,7 +12,9 @@
@@ -45,19 +45,18 @@ index 49f3c4f..6d5a6ab 100644
 +#include <atomic>
  #include <regex>
 +#include <thread>
+ #include <unordered_set>
  
  static const size_t kiB = 1024;
- static const size_t MiB = 1024*kiB;
-@@ -1509,18 +1511,23 @@ bool llama_model_loader::load_all_data(
+@@ -1576,17 +1578,23 @@ bool llama_model_loader::load_all_data(
      }
  
      // Buffer size: balance between memory usage and I/O efficiency
--    // 64MB works well for NVMe drives
--    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
 +    // 64MB works well for NVMe drives. The mmap staging path (memcpy from the
 +    // mapping) has no per-read latency to hide, so bigger chunks amortize the
 +    // per-chunk event synchronization instead.
-+    const size_t buffer_size = (alignment != 1 || use_mmap) ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
++    const size_t buffer_size = (alignment != 1 || use_mmap) ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
  
      std::vector<ggml_backend_buffer_t> host_buffers;
      std::vector<ggml_backend_event_t> events;
@@ -74,9 +73,9 @@ index 49f3c4f..6d5a6ab 100644
 +        // filled with memcpy from the mapping, which reads the page cache at
 +        // memory speed instead of the synchronous pageable-copy fallback.
          // First determine if the backend supports the necessary features for async uploads.
-         auto * buf = bufs.count(0) ? bufs.at(0) : nullptr;
+         auto * buf = bufs.empty() ? nullptr : bufs[0];
          if (!buf) {
-@@ -1615,6 +1622,63 @@ bool llama_model_loader::load_all_data(
+@@ -1681,6 +1689,63 @@ bool llama_model_loader::load_all_data(
          });
      }
  
@@ -140,7 +139,7 @@ index 49f3c4f..6d5a6ab 100644
      for (struct ggml_tensor * cur : tensors) {
          const auto * weight = get_weight(ggml_get_name(cur));
          if (weight == nullptr) {
-@@ -1659,6 +1723,29 @@ bool llama_model_loader::load_all_data(
+@@ -1731,6 +1796,29 @@ bool llama_model_loader::load_all_data(
                  auto & mmap_used = mmaps_used[weight->idx];
                  mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                  mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
@@ -170,6 +169,3 @@ index 49f3c4f..6d5a6ab 100644
              } else {
                  ggml_backend_tensor_set(cur, data, 0, n_size);
              }
--- 
-2.53.0.windows.2
-
