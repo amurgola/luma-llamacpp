@@ -1,0 +1,366 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Tue, 3 Nov 2026 09:37:30 -0500
+Subject: [PATCH 8/9] moe: lock a RAM tier of host experts (--moe-ram-mib)
+
+Locks up to N MiB of the host expert slices in RAM at context creation
+(VirtualLock / mlock after a ranged prefetch, a few layers at a time): the
+most used experts of the profile first, skipping the ones the device cache
+already holds, else from the first layer on. Neither a prompt scan nor another
+process can page them out, so their misses from the device cache come at
+memcpy speed instead of the soft-fault or SSD path.
+---
+ common/arg.cpp            |  10 ++++
+ common/common.cpp         |   1 +
+ common/common.h           |   1 +
+ include/llama.h           |   1 +
+ src/llama-context.cpp     |   8 +++
+ src/llama-cparams.h       |   1 +
+ src/llama-mmap.cpp        |  42 ++++++++++++++
+ src/llama-mmap.h          |   6 ++
+ src/llama-moe-profile.cpp | 119 ++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-profile.h   |  10 ++++
+ 10 files changed, 199 insertions(+)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index ced7a75d9..49c81565c 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2804,6 +2804,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.moe_profile = value;
+         }
+     ).set_env("LLAMA_ARG_MOE_PROFILE"));
++    add_opt(common_arg(
++        {"--moe-ram-mib"}, "N",
++        "lock N MiB of the MoE experts kept in the CPU in RAM, so that neither prompt scans nor other processes page them out: the most used experts first when --moe-profile has data, else from the first layer on (default: 0, none)",
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.moe_ram_size = (size_t) value*1024*1024;
++        }
++    ).set_env("LLAMA_ARG_MOE_RAM_MIB"));
+     add_opt(common_arg(
+         {"-ncffn", "--n-cpu-ffn"}, "N",
+         "keep the dense FFN weights of the first N layers in the CPU\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index cf9f7df70..47136623d 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1747,6 +1747,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.moe_cache_size = params.moe_cache_size;
+     cparams.moe_stage_size = params.moe_stage_size;
+     cparams.moe_profile    = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
++    cparams.moe_ram_size   = params.moe_ram_size;
+ 
+     return cparams;
+ }
+diff --git a/common/common.h b/common/common.h
+index cf88757ae..12cec85a5 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -598,6 +598,7 @@ struct common_params {
+     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+     size_t moe_stage_size = 128u*1024*1024; // pinned staging bytes per buffer (two per GPU) for the uploads of the experts kept in the CPU
+     std::string moe_profile; // path of the expert use profile kept across runs (empty = none)
++    size_t moe_ram_size = 0; // bytes of the MoE experts kept in the CPU to lock in RAM, the most used first when a profile exists
+ 
+     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index 761a250b6..f7580e4c0 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -399,6 +399,7 @@ extern "C" {
+         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+         size_t moe_stage_size; // pinned staging bytes per buffer (two per device) for the uploads of host experts, 0 = unstaged copies [EXPERIMENTAL]
+         const char * moe_profile; // path of the expert use profile: read to seed the MoE cache, written as the experts are routed, NULL = none [EXPERIMENTAL]
++        size_t moe_ram_size; // bytes of host experts locked in RAM at creation, the most used first when a profile exists, 0 = none [EXPERIMENTAL]
+ 
+         // Abort callback
+         // if it returns true, execution of llama_decode() will be aborted
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 80848a893..8da2e3bdc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -361,6 +361,7 @@ llama_context::llama_context(
+     cparams.kv_unified     = params.kv_unified;
+     cparams.moe_cache_size = params.moe_cache_size;
+     cparams.moe_stage_size = params.moe_stage_size;
++    cparams.moe_ram_size   = params.moe_ram_size;
+ 
+     // initialized later
+     cparams.pipeline_parallel = false;
+@@ -564,6 +565,12 @@ llama_context::llama_context(
+                 params.moe_profile != nullptr && params.moe_profile[0] != 0 ? &moe_profile : nullptr, params.moe_profile);
+         }
+ 
++        // the RAM tier below the device cache: the experts the cache does not hold, the most used first
++        if (cparams.moe_ram_size > 0 && !model.hparams.no_alloc) {
++            llama_moe_pin_host_experts(model, cparams.moe_ram_size, moe_profile.empty() ? nullptr : &moe_profile,
++                [this](int32_t il, int32_t e) { return moe_cache && moe_cache->is_cached(il, e); });
++        }
++
+         sched_reserve();
+ 
+         if (!cparams.flash_attn) {
+@@ -4047,6 +4054,7 @@ llama_context_params llama_context_default_params() {
+         /*.moe_cache_size              =*/ 0,
+         /*.moe_stage_size              =*/ 128u*1024*1024,
+         /*.moe_profile                 =*/ nullptr,
++        /*.moe_ram_size                =*/ 0,
+         /*.abort_callback              =*/ nullptr,
+         /*.abort_callback_data         =*/ nullptr,
+         /*.embeddings                  =*/ false,
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index f06a53c9b..c160c8d8e 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -57,6 +57,7 @@ struct llama_cparams {
+ 
+     size_t moe_cache_size;
+     size_t moe_stage_size;
++    size_t moe_ram_size;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 85453c1e8..a65b4f05f 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -874,6 +874,48 @@ const bool llama_mlock::SUPPORTED = true;
+ const bool llama_mlock::SUPPORTED = false;
+ #endif
+ 
++#if defined(_WIN32)
++void llama_mlock_reserve(size_t bytes) {
++    SIZE_T min_ws_size, max_ws_size;
++    if (!GetProcessWorkingSetSize(GetCurrentProcess(), &min_ws_size, &max_ws_size)) {
++        LLAMA_LOG_WARN("warning: GetProcessWorkingSetSize failed: %s\n", llama_format_win_err(GetLastError()).c_str());
++        return;
++    }
++    if (!SetProcessWorkingSetSize(GetCurrentProcess(), min_ws_size + bytes, max_ws_size + bytes)) {
++        LLAMA_LOG_WARN("warning: SetProcessWorkingSetSize failed: %s\n", llama_format_win_err(GetLastError()).c_str());
++    }
++}
++
++bool llama_mlock_range(void * addr, size_t len) {
++    if (VirtualLock(addr, len)) {
++        return true;
++    }
++    llama_mlock_reserve(len + 1048576);
++    return VirtualLock(addr, len) != 0;
++}
++#elif defined(_POSIX_MEMLOCK_RANGE)
++void llama_mlock_reserve(size_t bytes) {
++    GGML_UNUSED(bytes);
++}
++
++bool llama_mlock_range(void * addr, size_t len) {
++    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++    const uintptr_t first = (uintptr_t) addr / page * page;
++    const uintptr_t last  = ((uintptr_t) addr + len + page - 1) / page * page;
++    return mlock((void *) first, last - first) == 0;
++}
++#else
++void llama_mlock_reserve(size_t bytes) {
++    GGML_UNUSED(bytes);
++}
++
++bool llama_mlock_range(void * addr, size_t len) {
++    GGML_UNUSED(addr);
++    GGML_UNUSED(len);
++    return false;
++}
++#endif
++
+ void llama_prefetch(llama_memory_ranges mr) {
+ #if defined(__linux__) || defined(__APPLE__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
+     if (mr.empty()) {
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index e322c3578..2b02bd2f4 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -95,4 +95,10 @@ using llama_memory_ranges = std::vector<llama_memory_range>;
+ // Prefetch the host pages covering these memory ranges.
+ void llama_prefetch(llama_memory_ranges mr);
+ 
++// Lock [addr, addr + len) in RAM (VirtualLock / mlock); on Windows the working set limit is raised when it is short.
++bool llama_mlock_range(void * addr, size_t len);
++
++// Raise the working set limit by bytes ahead of many llama_mlock_range calls (Windows only, no-op elsewhere).
++void llama_mlock_reserve(size_t bytes);
++
+ size_t llama_path_max();
+diff --git a/src/llama-moe-profile.cpp b/src/llama-moe-profile.cpp
+index d346775dd..931cf1987 100644
+--- a/src/llama-moe-profile.cpp
++++ b/src/llama-moe-profile.cpp
+@@ -1,12 +1,16 @@
+ #include "llama-moe-profile.h"
+ 
+ #include "llama-impl.h"
++#include "llama-mmap.h"
++#include "llama-model.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdio>
+ #include <fstream>
+ #include <numeric>
+ #include <sstream>
++#include <thread>
+ 
+ void llama_moe_profile::init(int32_t n_layer, int32_t n_expert) {
+     this->n_layer  = n_layer;
+@@ -77,6 +81,121 @@ bool llama_moe_profile::load(const std::string & path, int32_t n_layer, int32_t
+     return true;
+ }
+ 
++size_t llama_moe_pin_host_experts(const llama_model & model, size_t budget, const llama_moe_profile * profile,
++        const std::function<bool(int32_t, int32_t)> & skip) {
++    const int32_t n_layer = (int32_t) model.layers.size();
++
++    // the host expert tensors of each layer, in any order: an expert is the same slice of each of them
++    std::vector<std::vector<const ggml_tensor *>> experts(n_layer);
++    int32_t n_expert = 0;
++    for (int32_t il = 0; il < n_layer; ++il) {
++        const auto & layer = model.layers[il];
++        for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++            if (t != nullptr && t->buffer != nullptr && t->data != nullptr &&
++                    ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                    ggml_backend_buffer_is_host(t->buffer)) {
++                experts[il].push_back(t);
++                n_expert = std::max<int32_t>(n_expert, (int32_t) t->ne[2]);
++            }
++        }
++    }
++    if (n_expert == 0) {
++        LLAMA_LOG_WARN("%s: no expert tensor is in host memory, nothing to lock\n", __func__);
++        return 0;
++    }
++
++    std::vector<std::pair<int32_t, int32_t>> order;
++    if (profile != nullptr && !profile->empty() && profile->n_layer == n_layer && profile->n_expert == n_expert) {
++        order = profile->ranked();
++    } else {
++        order.reserve((size_t) n_layer*n_expert);
++        for (int32_t il = 0; il < n_layer; ++il) {
++            for (int32_t e = 0; e < n_expert; ++e) {
++                order.emplace_back(il, e);
++            }
++        }
++    }
++
++    // the ranges to lock, per layer
++    struct range {
++        void * addr;
++        size_t len;
++    };
++    std::vector<std::vector<range>> ranges(n_layer);
++    size_t selected = 0;
++    size_t n_selected = 0;
++    size_t n_total = 0;
++    for (int32_t il = 0; il < n_layer; ++il) {
++        n_total += experts[il].empty() ? 0 : experts[il][0]->ne[2];
++    }
++    for (const auto & [il, e] : order) {
++        if (experts[il].empty() || e >= (int32_t) experts[il][0]->ne[2] || skip(il, e)) {
++            continue;
++        }
++        size_t bytes = 0;
++        for (const ggml_tensor * t : experts[il]) {
++            bytes += t->nb[2];
++        }
++        if (selected + bytes > budget) {
++            break;
++        }
++        for (const ggml_tensor * t : experts[il]) {
++            ranges[il].push_back({ (uint8_t *) t->data + (size_t) e*t->nb[2], t->nb[2] });
++        }
++        selected += bytes;
++        n_selected++;
++    }
++    if (n_selected == 0) {
++        LLAMA_LOG_WARN("%s: the budget of %.2f MiB holds no expert, nothing to lock\n", __func__, budget/1024.0/1024.0);
++        return 0;
++    }
++
++    const int64_t t_start = ggml_time_us();
++    llama_mlock_reserve(selected + 64u*1024*1024);
++
++    // the pages are read ahead with all the reads of a layer in flight, then locked, a few layers at a time
++    std::atomic<int32_t> next{0};
++    std::atomic<size_t> locked{0};
++    std::atomic<size_t> n_failed{0};
++    auto work = [&]() {
++        for (int32_t il = next.fetch_add(1); il < n_layer; il = next.fetch_add(1)) {
++            if (ranges[il].empty()) {
++                continue;
++            }
++            llama_memory_ranges mr;
++            mr.reserve(ranges[il].size());
++            for (const range & r : ranges[il]) {
++                mr.push_back({ r.addr, r.len });
++            }
++            llama_prefetch(std::move(mr));
++            for (const range & r : ranges[il]) {
++                if (llama_mlock_range(r.addr, r.len)) {
++                    locked += r.len;
++                } else {
++                    n_failed++;
++                }
++            }
++        }
++    };
++    const int n_threads = std::max(1, std::min(4, (int) std::thread::hardware_concurrency()/2));
++    std::vector<std::thread> threads;
++    for (int t = 1; t < n_threads; ++t) {
++        threads.emplace_back(work);
++    }
++    work();
++    for (auto & t : threads) {
++        t.join();
++    }
++
++    LLAMA_LOG_INFO("%s: locked %.2f GiB of host experts in RAM (%zu of %zu experts, %s order) in %.1f s\n", __func__,
++        locked/1024.0/1024.0/1024.0, n_selected, n_total, profile != nullptr && !profile->empty() ? "profile" : "layer",
++        (ggml_time_us() - t_start)/1e6);
++    if (n_failed > 0) {
++        LLAMA_LOG_WARN("%s: %zu expert ranges could not be locked, they stay pageable\n", __func__, (size_t) n_failed);
++    }
++    return locked;
++}
++
+ bool llama_moe_profile::save(const std::string & path) {
+     if (empty()) {
+         return false;
+diff --git a/src/llama-moe-profile.h b/src/llama-moe-profile.h
+index 9b9a4191c..39555366d 100644
+--- a/src/llama-moe-profile.h
++++ b/src/llama-moe-profile.h
+@@ -1,10 +1,14 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
++struct llama_model;
++
+ // How often each expert of each layer was routed to, kept across runs in a small text file so that the next run can
+ // place the experts before the first token is routed: the most used ones in the device cache, the next in locked RAM.
+ struct llama_moe_profile {
+@@ -37,3 +41,9 @@ struct llama_moe_profile {
+ 
+     static constexpr uint64_t max_count = 1ull << 40;
+ };
++
++// Lock up to budget bytes of the model's host expert tensors in RAM, the most used first when a profile is given
++// (else from the first layer on), skipping the experts for which skip(il, e) is true (the ones a device cache holds).
++// Returns the bytes locked. The lock lasts for the process, like the mappings it covers.
++size_t llama_moe_pin_host_experts(const llama_model & model, size_t budget, const llama_moe_profile * profile,
++        const std::function<bool(int32_t, int32_t)> & skip);

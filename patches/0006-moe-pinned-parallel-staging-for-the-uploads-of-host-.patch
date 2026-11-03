@@ -1,0 +1,837 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Tue, 3 Nov 2026 09:36:37 -0500
+Subject: [PATCH 6/9] moe: pinned parallel staging for the uploads of host
+ experts
+
+Host experts are memory-mapped and pageable, so every upload was a synchronous
+driver copy soft-faulting the mapping page by page on one thread (2 to 3 GB/s,
+less from disk). llama_host_stager copies the source into a pinned buffer on
+several threads, the device reads it asynchronously while the threads fill the
+other buffer, and the pages of a large batch are read at low memory priority
+so a prompt scan no longer evicts the experts generation keeps hitting.
+Default 128 MiB x 2 per GPU for models with host experts (--moe-stage-mib).
+---
+ common/arg.cpp            |  10 +
+ common/common.cpp         |   1 +
+ common/common.h           |   1 +
+ include/llama.h           |   1 +
+ src/CMakeLists.txt        |   1 +
+ src/llama-context.cpp     |  36 +++-
+ src/llama-context.h       |   7 +
+ src/llama-cparams.h       |   1 +
+ src/llama-host-stager.cpp | 423 ++++++++++++++++++++++++++++++++++++++
+ src/llama-host-stager.h   |  56 +++++
+ src/llama-moe-cache.cpp   |  26 ++-
+ src/llama-moe-cache.h     |   5 +-
+ 12 files changed, 559 insertions(+), 9 deletions(-)
+ create mode 100644 src/llama-host-stager.cpp
+ create mode 100644 src/llama-host-stager.h
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 8b302d5d7..89a1e1c5f 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2787,6 +2787,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.moe_cache_size = (size_t) value*1024*1024;
+         }
+     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
++    add_opt(common_arg(
++        {"--moe-stage-mib"}, "N",
++        "pinned staging buffer size in MiB (two per GPU) for the uploads of the MoE experts kept in the CPU: several threads copy the experts into pinned memory and the GPU reads it asynchronously (default: 128, 0 = plain copies)",
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.moe_stage_size = (size_t) value*1024*1024;
++        }
++    ).set_env("LLAMA_ARG_MOE_STAGE_MIB"));
+     add_opt(common_arg(
+         {"-ncffn", "--n-cpu-ffn"}, "N",
+         "keep the dense FFN weights of the first N layers in the CPU\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index b59e66e3b..ccbbb0b2f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1745,6 +1745,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.type_v = params.cache_type_v;
+ 
+     cparams.moe_cache_size = params.moe_cache_size;
++    cparams.moe_stage_size = params.moe_stage_size;
+ 
+     return cparams;
+ }
+diff --git a/common/common.h b/common/common.h
+index 0c2d5e46f..58b4f8776 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -596,6 +596,7 @@ struct common_params {
+     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+ 
+     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
++    size_t moe_stage_size = 128u*1024*1024; // pinned staging bytes per buffer (two per GPU) for the uploads of the experts kept in the CPU
+ 
+     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index 3af6e2223..43a1af610 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -397,6 +397,7 @@ extern "C" {
+         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+ 
+         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
++        size_t moe_stage_size; // pinned staging bytes per buffer (two per device) for the uploads of host experts, 0 = unstaged copies [EXPERIMENTAL]
+ 
+         // Abort callback
+         // if it returns true, execution of llama_decode() will be aborted
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 97250c2e8..deef78ff6 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -28,6 +28,7 @@ set(LLAMA_CORE_SOURCES
+     llama-kv-cache-msa.cpp
+     llama-kv-cache-dsv4.cpp
+     llama-memory.cpp
++    llama-host-stager.cpp
+     llama-moe-cache.cpp
+     llama-memory-hybrid.cpp
+     llama-memory-hybrid-iswa.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 2fd05fecf..33ccbb516 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -20,6 +20,7 @@
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ 
+ //
+@@ -359,6 +360,7 @@ llama_context::llama_context(
+     cparams.op_offload     = params.op_offload;
+     cparams.kv_unified     = params.kv_unified;
+     cparams.moe_cache_size = params.moe_cache_size;
++    cparams.moe_stage_size = params.moe_stage_size;
+ 
+     // initialized later
+     cparams.pipeline_parallel = false;
+@@ -548,8 +550,13 @@ llama_context::llama_context(
+             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+         }
+ 
++        if (cparams.moe_stage_size > 0 && llama_host_stager::model_has_host_experts(model)) {
++            const int n_copy_threads = std::max(2, std::min(8, (int) std::thread::hardware_concurrency()/2));
++            host_stager = std::make_unique<llama_host_stager>(backend_ptrs, cparams.moe_stage_size, n_copy_threads);
++        }
++
+         if (cparams.moe_cache_size > 0) {
+-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
++            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, host_stager.get());
+         }
+ 
+         sched_reserve();
+@@ -2788,6 +2795,19 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
+ 
++    // the uploads of a large batch read most of the weight: staged through pinned memory by several threads when
++    // the stager serves this device, and marked as the first pages to evict so they do not push out the experts
++    // that generation keeps hitting
++    const bool staged = lctx->host_stager && lctx->host_stager->enabled(backend);
++    st.reqs.clear();
++    auto upload = [&](size_t offset, size_t size) {
++        if (staged) {
++            st.reqs.push_back({ dst, offset, (const uint8_t *) src->data + offset, size });
++        } else {
++            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
++        }
++    };
++
+     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+@@ -2825,7 +2845,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 continue;
+             }
+             if (next < e) {
+-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
++                upload(next*expert_size, (e - next)*expert_size);
+             }
+             e   += n;
+             next = e;
+@@ -2836,12 +2856,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+         const size_t size    = (last + 1 - next)*expert_size + padding;
+         if (size > 0) {
+-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
++            upload(offset, size);
+         }
+ 
+         first = last + 1;
+     }
+ 
++    if (!st.reqs.empty()) {
++        lctx->host_stager->upload(backend, st.reqs, /*low_priority=*/ true);
++    }
++
+     return true;
+ }
+ 
+@@ -3714,6 +3738,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+             ret[buft].context += size;
+         }
+     }
++    if (host_stager) {
++        for (const auto & [buft, size] : host_stager->memory_breakdown()) {
++            ret[buft].context += size;
++        }
++    }
+     if (model.hparams.no_alloc) {
+         for (size_t i = 0; i < backends.size(); ++i) {
+             ggml_backend_t             backend = backends[i].get();
+@@ -4004,6 +4033,7 @@ llama_context_params llama_context_default_params() {
+         /*.type_k                      =*/ GGML_TYPE_F16,
+         /*.type_v                      =*/ GGML_TYPE_F16,
+         /*.moe_cache_size              =*/ 0,
++        /*.moe_stage_size              =*/ 128u*1024*1024,
+         /*.abort_callback              =*/ nullptr,
+         /*.abort_callback_data         =*/ nullptr,
+         /*.embeddings                  =*/ false,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb103..8ab0d68b6 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -8,6 +8,7 @@
+ #include "llama-impl.h"
+ #include "llama-memory.h"
+ #include "llama-moe-cache.h"
++#include "llama-host-stager.h"
+ 
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
+@@ -309,6 +310,9 @@ private:
+     llama_memory_ptr memory;
+     llama_moe_cache_ptr moe_cache;
+ 
++    // pinned staging for the uploads of host experts, created when the model keeps experts in host memory
++    llama_host_stager_ptr host_stager;
++
+     // decode output (2-dimensional array: [n_outputs][n_vocab])
+     buffer_view<float> logits = {nullptr, 0};
+ 
+@@ -378,10 +382,13 @@ private:
+         std::vector<int32_t> ids_data;
+         std::vector<bool>    used;
+ 
++        std::vector<llama_host_stager::request> reqs; // uploads of one weight, staged together
++
+         void reset() {
+             ids = nullptr;
+             ids_data.clear();
+             used.clear();
++            reqs.clear();
+         }
+     };
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index f4eb181a7..f06a53c9b 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -56,6 +56,7 @@ struct llama_cparams {
+     bool training;           // set by llama_opt_init()
+ 
+     size_t moe_cache_size;
++    size_t moe_stage_size;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-host-stager.cpp b/src/llama-host-stager.cpp
+new file mode 100644
+index 000000000..aac761a38
+--- /dev/null
++++ b/src/llama-host-stager.cpp
+@@ -0,0 +1,423 @@
++#include "llama-host-stager.h"
++
++#include "llama-impl.h"
++#include "llama-mmap.h"
++#include "llama-model.h"
++
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <cstring>
++#include <functional>
++#include <mutex>
++#include <stdexcept>
++#include <thread>
++
++#if defined(_WIN32)
++#   define WIN32_LEAN_AND_MEAN
++#   ifndef NOMINMAX
++#       define NOMINMAX
++#   endif
++#   include <windows.h>
++#elif defined(__linux__)
++#   include <sys/mman.h>
++#   include <unistd.h>
++#   ifndef MADV_COLD
++#       define MADV_COLD 20
++#   endif
++#endif
++
++namespace {
++
++// the memory priority of a thread is the standby priority of the pages it faults in: pages read at a low priority
++// are repurposed before the pages read at the normal one
++void llama_host_stager_set_memory_priority(bool low) {
++#if defined(_WIN32)
++    using set_thread_information_t = BOOL (WINAPI *)(HANDLE, int, LPVOID, DWORD);
++    static const auto pSetThreadInformation = (set_thread_information_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
++    if (!pSetThreadInformation) {
++        return;
++    }
++    thread_local int current = -1;
++    const int wanted = low ? 1 : 5; // MEMORY_PRIORITY_VERY_LOW : MEMORY_PRIORITY_NORMAL
++    if (current == wanted) {
++        return;
++    }
++    struct { ULONG MemoryPriority; } info = { (ULONG) wanted };
++    if (pSetThreadInformation(GetCurrentThread(), 0 /* ThreadMemoryPriority */, &info, sizeof(info))) {
++        current = wanted;
++    }
++#else
++    GGML_UNUSED(low);
++#endif
++}
++
++// after a low priority copy on POSIX, hand the source pages back to the OS as the first to reclaim
++void llama_host_stager_release_pages(const void * src, size_t size) {
++#if defined(__linux__)
++    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++    const uintptr_t first = (uintptr_t) src / page * page;
++    const uintptr_t last  = ((uintptr_t) src + size + page - 1) / page * page;
++    if (last > first) {
++        madvise((void *) first, last - first, MADV_COLD);
++    }
++#else
++    GGML_UNUSED(src);
++    GGML_UNUSED(size);
++#endif
++}
++
++struct llama_host_stager_piece {
++    const uint8_t * src;
++    uint8_t       * dst;
++    size_t          size;
++};
++
++// a small pool of copy threads; the caller runs pieces too
++struct llama_host_stager_pool {
++    std::vector<std::thread> workers;
++    std::mutex mutex;
++    std::condition_variable cv_work;
++    std::condition_variable cv_done;
++    uint64_t generation = 0;
++    int n_busy = 0;
++    bool stop = false;
++
++    const std::vector<llama_host_stager_piece> * pieces = nullptr;
++    std::atomic<size_t> next{0};
++    bool low_priority = false;
++
++    explicit llama_host_stager_pool(int n_threads) {
++        for (int t = 0; t < n_threads - 1; ++t) {
++            workers.emplace_back([this] { worker(); });
++        }
++    }
++
++    ~llama_host_stager_pool() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stop = true;
++        }
++        cv_work.notify_all();
++        for (auto & w : workers) {
++            w.join();
++        }
++    }
++
++    void copy_pieces() {
++        llama_host_stager_set_memory_priority(low_priority);
++        for (size_t i = next.fetch_add(1); i < pieces->size(); i = next.fetch_add(1)) {
++            const auto & p = (*pieces)[i];
++            memcpy(p.dst, p.src, p.size);
++            if (low_priority) {
++                llama_host_stager_release_pages(p.src, p.size);
++            }
++        }
++    }
++
++    void worker() {
++        uint64_t seen = 0;
++        while (true) {
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                cv_work.wait(lock, [&] { return stop || generation != seen; });
++                if (stop) {
++                    return;
++                }
++                seen = generation;
++            }
++            copy_pieces();
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                if (--n_busy == 0) {
++                    cv_done.notify_all();
++                }
++            }
++        }
++    }
++
++    void run(const std::vector<llama_host_stager_piece> & ps, bool low) {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            pieces       = &ps;
++            low_priority = low;
++            next         = 0;
++            n_busy       = (int) workers.size();
++            generation++;
++        }
++        cv_work.notify_all();
++        copy_pieces();
++        std::unique_lock<std::mutex> lock(mutex);
++        cv_done.wait(lock, [&] { return n_busy == 0; });
++    }
++};
++
++}
++
++struct llama_host_stager::impl {
++    struct device {
++        ggml_backend_t backend = nullptr;
++        ggml_backend_buffer_ptr bufs[2];
++        uint8_t * base[2] = { nullptr, nullptr };
++        ggml_backend_event_t events[2] = { nullptr, nullptr };
++        bool pending[2] = { false, false };
++        int next = 0;
++    };
++
++    // one piece per thread hop: large enough to amortize the hand-off, small enough to balance the threads
++    static constexpr size_t piece_size = 2u*1024*1024;
++
++    // pages to read ahead of the copy threads, in staging buffers
++    static constexpr int prefetch_ahead = 2;
++
++    size_t buffer_size;
++    std::vector<device> devices;
++    llama_host_stager_pool pool;
++
++    struct dma {
++        ggml_tensor * dst;
++        size_t dst_offset;
++        size_t stage_offset;
++        size_t size;
++    };
++
++    // one fill of a staging buffer
++    struct window {
++        std::vector<llama_host_stager_piece> pieces;
++        std::vector<dma> dmas;
++        std::vector<request> sources;
++    };
++
++    std::vector<window> windows;
++
++    struct stats {
++        size_t  bytes = 0;
++        int64_t t_us  = 0;
++        size_t  n     = 0;
++    };
++
++    stats stats_low;
++    stats stats_normal;
++
++    impl(const std::vector<ggml_backend_t> & backends, size_t buffer_size, int n_threads) :
++            buffer_size(buffer_size), pool(std::max(1, n_threads)) {
++        for (ggml_backend_t backend : backends) {
++            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++            if (dev == nullptr) {
++                continue;
++            }
++            const auto dev_type = ggml_backend_dev_type(dev);
++            if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++                continue;
++            }
++            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
++            if (buft == nullptr) {
++                continue;
++            }
++            device d;
++            d.backend = backend;
++            bool ok = true;
++            for (int k = 0; k < 2 && ok; ++k) {
++                d.bufs[k].reset(ggml_backend_buft_alloc_buffer(buft, buffer_size));
++                if (!d.bufs[k]) {
++                    ok = false;
++                    break;
++                }
++                d.base[k] = (uint8_t *) ggml_backend_buffer_get_base(d.bufs[k].get());
++                d.events[k] = ggml_backend_event_new(dev);
++            }
++            if (!ok) {
++                LLAMA_LOG_WARN("%s: could not allocate %zu MiB of pinned memory for %s, uploads stay unstaged\n",
++                    __func__, 2*buffer_size/1024/1024, ggml_backend_dev_name(dev));
++                for (int k = 0; k < 2; ++k) {
++                    if (d.events[k]) {
++                        ggml_backend_event_free(d.events[k]);
++                    }
++                }
++                continue;
++            }
++            devices.push_back(std::move(d));
++            LLAMA_LOG_INFO("%s: %10s staging buffers = %8.2f MiB (%d copy threads)\n", __func__,
++                ggml_backend_buft_name(buft), 2*buffer_size/1024.0/1024.0, std::max(1, n_threads));
++        }
++    }
++
++    ~impl() {
++        for (device & d : devices) {
++            for (int k = 0; k < 2; ++k) {
++                if (d.pending[k]) {
++                    if (d.events[k]) {
++                        ggml_backend_event_synchronize(d.events[k]);
++                    } else {
++                        ggml_backend_synchronize(d.backend);
++                    }
++                }
++                if (d.events[k]) {
++                    ggml_backend_event_free(d.events[k]);
++                }
++            }
++        }
++        auto log = [](const char * name, const stats & st) {
++            if (st.n == 0) {
++                return;
++            }
++            LLAMA_LOG_INFO("llama_host_stager: %s: %zu uploads, %.2f GiB in %.2f s (%.2f GB/s)\n",
++                name, st.n, st.bytes/1024.0/1024.0/1024.0, st.t_us/1e6, st.t_us > 0 ? st.bytes/1e3/st.t_us : 0.0);
++        };
++        log("generation (normal priority)", stats_normal);
++        log("large batches (low priority) ", stats_low);
++    }
++
++    device * find(ggml_backend_t backend) {
++        for (device & d : devices) {
++            if (d.backend == backend) {
++                return &d;
++            }
++        }
++        return nullptr;
++    }
++
++    // cut the requests into staging buffer fills
++    void plan(const std::vector<request> & reqs, uint8_t * const bases[2]) {
++        windows.clear();
++        size_t ir = 0;
++        size_t roff = 0;
++        while (ir < reqs.size()) {
++            windows.emplace_back();
++            window & w = windows.back();
++            uint8_t * base = bases[windows.size() % 2 == 1 ? 0 : 1];
++            size_t fill = 0;
++            while (ir < reqs.size() && fill < buffer_size) {
++                const request & r = reqs[ir];
++                if (r.size == 0) {
++                    ir++;
++                    continue;
++                }
++                const size_t n = std::min(r.size - roff, buffer_size - fill);
++                w.dmas.push_back({ r.dst, r.dst_offset + roff, fill, n });
++                w.sources.push_back({ nullptr, 0, (const uint8_t *) r.src + roff, n });
++                for (size_t p = 0; p < n; p += piece_size) {
++                    w.pieces.push_back({ (const uint8_t *) r.src + roff + p, base + fill + p, std::min(piece_size, n - p) });
++                }
++                fill += n;
++                roff += n;
++                if (roff == r.size) {
++                    ir++;
++                    roff = 0;
++                }
++            }
++        }
++    }
++
++    void upload(ggml_backend_t backend, const std::vector<request> & reqs, bool low) {
++        device * d = find(backend);
++        GGML_ASSERT(d != nullptr);
++
++        const int64_t t_start = ggml_time_us();
++
++        // the prefetches below are issued at this priority too
++        llama_host_stager_set_memory_priority(low);
++
++        // fills alternate between the two buffers from the one that is free next
++        uint8_t * bases[2] = { d->base[d->next], d->base[d->next ^ 1] };
++        plan(reqs, bases);
++
++        size_t bytes = 0;
++        for (size_t iw = 0; iw < windows.size(); ++iw) {
++            if (iw == 0) {
++                for (int a = 0; a < prefetch_ahead && (size_t) a < windows.size(); ++a) {
++                    prefetch(windows[a].sources);
++                }
++            } else if (iw + prefetch_ahead - 1 < windows.size()) {
++                prefetch(windows[iw + prefetch_ahead - 1].sources);
++            }
++
++            const int k = d->next;
++            d->next ^= 1;
++
++            // the DMA that last read this buffer must be done before it is overwritten
++            if (d->pending[k]) {
++                if (d->events[k]) {
++                    ggml_backend_event_synchronize(d->events[k]);
++                } else {
++                    ggml_backend_synchronize(backend);
++                }
++                d->pending[k] = false;
++            }
++
++            window & w = windows[iw];
++            pool.run(w.pieces, low);
++            for (const dma & m : w.dmas) {
++                ggml_backend_tensor_set_async(backend, m.dst, d->base[k] + m.stage_offset, m.dst_offset, m.size);
++                bytes += m.size;
++            }
++            if (d->events[k]) {
++                ggml_backend_event_record(d->events[k], backend);
++            }
++            d->pending[k] = true;
++        }
++
++        llama_host_stager_set_memory_priority(false);
++
++        stats & st = low ? stats_low : stats_normal;
++        st.bytes += bytes;
++        st.t_us  += ggml_time_us() - t_start;
++        st.n++;
++    }
++};
++
++bool llama_host_stager::model_has_host_experts(const llama_model & model) {
++    for (const auto & layer : model.layers) {
++        for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++            if (t != nullptr && t->buffer != nullptr &&
++                    ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                    ggml_backend_buffer_is_host(t->buffer)) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++llama_host_stager::llama_host_stager(const std::vector<ggml_backend_t> & backends, size_t buffer_size, int n_threads) :
++    pimpl(new impl(backends, buffer_size, n_threads)) {
++}
++
++llama_host_stager::~llama_host_stager() = default;
++
++bool llama_host_stager::enabled(ggml_backend_t backend) const {
++    return pimpl->find(backend) != nullptr;
++}
++
++size_t llama_host_stager::buffer_size() const {
++    return pimpl->buffer_size;
++}
++
++void llama_host_stager::upload(ggml_backend_t backend, const std::vector<request> & reqs, bool low_priority) {
++    pimpl->upload(backend, reqs, low_priority);
++}
++
++void llama_host_stager::prefetch(const std::vector<request> & reqs) {
++    llama_memory_ranges mr;
++    mr.reserve(reqs.size());
++    for (const request & r : reqs) {
++        if (r.src != nullptr && r.size > 0) {
++            mr.push_back({ r.src, r.size });
++        }
++    }
++    llama_prefetch(std::move(mr));
++}
++
++std::map<ggml_backend_buffer_type_t, size_t> llama_host_stager::memory_breakdown() const {
++    std::map<ggml_backend_buffer_type_t, size_t> res;
++    for (const auto & d : pimpl->devices) {
++        for (int k = 0; k < 2; ++k) {
++            if (d.bufs[k]) {
++                res[ggml_backend_buffer_get_type(d.bufs[k].get())] += ggml_backend_buffer_get_size(d.bufs[k].get());
++            }
++        }
++    }
++    return res;
++}
+diff --git a/src/llama-host-stager.h b/src/llama-host-stager.h
+new file mode 100644
+index 000000000..7f5b807dd
+--- /dev/null
++++ b/src/llama-host-stager.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <vector>
++
++struct llama_model;
++
++// Uploads bytes of host weights to a device through pinned staging buffers.
++//
++// The experts kept in host memory are memory-mapped and pageable, so a plain upload is a synchronous copy by the
++// driver that soft-faults the mapping one page at a time on one thread (2 to 3 GB/s, less when the pages come from
++// the disk). Here several threads copy the source into a pinned buffer, the faults scale with the threads, and the
++// device reads the pinned buffer asynchronously while the threads fill the other buffer.
++//
++// The pages touched for a large batch are marked as the first to evict: a prompt reads every expert of a layer, and
++// without that mark the scan pushes the experts that generation keeps hitting out of the page cache.
++class llama_host_stager {
++public:
++    struct request {
++        ggml_tensor * dst;    // device tensor
++        size_t        dst_offset;
++        const void  * src;    // host bytes
++        size_t        size;
++    };
++
++    // true if any expert tensor of the model lives in host memory, the only weights re-uploaded at run time
++    static bool model_has_host_experts(const llama_model & model);
++
++    // one pair of pinned buffers of buffer_size bytes per GPU backend that offers pinned memory
++    llama_host_stager(const std::vector<ggml_backend_t> & backends, size_t buffer_size, int n_threads);
++    ~llama_host_stager();
++
++    bool enabled(ggml_backend_t backend) const;
++
++    size_t buffer_size() const;
++
++    // copy the requests to the device: the sources are read ahead, staged through pinned memory by the threads and
++    // sent on the backend's stream. low_priority marks the host pages read as the first to evict (large batches).
++    void upload(ggml_backend_t backend, const std::vector<request> & reqs, bool low_priority);
++
++    // ask the OS to read the host pages of the requests ahead, with all the reads in flight at once
++    static void prefetch(const std::vector<request> & reqs);
++
++    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
++
++private:
++    struct impl;
++    std::unique_ptr<impl> pimpl;
++};
++
++using llama_host_stager_ptr = std::unique_ptr<llama_host_stager>;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f22d986dc..1eee277d2 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-moe-cache.h"
+ 
++#include "llama-host-stager.h"
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ 
+@@ -210,6 +211,9 @@ struct llama_moe_cache::impl {
+     std::vector<int32_t> ids;
+     std::vector<moe_cache_lru::fill> fills;
+ 
++    llama_host_stager * stager = nullptr;
++    std::vector<llama_host_stager::request> reqs;
++
+     // slot maps in host memory
+     ggml_context_ptr ctx_host;
+     ggml_backend_buffer_ptr buf_host;
+@@ -218,8 +222,9 @@ struct llama_moe_cache::impl {
+     // views used by copy_experts
+     ggml_context_ptr ctx_views;
+ 
+-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
++            llama_host_stager * stager) :
++            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), stager(stager) {
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+@@ -555,6 +560,9 @@ struct llama_moe_cache::impl {
+         }
+ 
+         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
++        // with a stager the pages of all the misses are read ahead at once and copied through pinned memory
++        const bool staged = stager != nullptr && stager->enabled(backend);
++        reqs.clear();
+         size_t bytes = 0;
+         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+             const ggml_tensor * w    = l.experts[ip];
+@@ -565,11 +573,18 @@ struct llama_moe_cache::impl {
+                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                     n++;
+                 }
+-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                if (staged) {
++                    reqs.push_back({ bank, fills[i].slot*expert_size, (const uint8_t *) w->data + fills[i].expert*expert_size, n*expert_size });
++                } else {
++                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                }
+                 bytes += n*expert_size;
+                 i += n;
+             }
+         }
++        if (!reqs.empty()) {
++            stager->upload(backend, reqs, /*low_priority=*/ false);
++        }
+ 
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+@@ -599,8 +614,9 @@ struct llama_moe_cache::impl {
+     }
+ };
+ 
+-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+-    pimpl(new impl(model, backends, bufts, size)) {
++llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
++        llama_host_stager * stager) :
++    pimpl(new impl(model, backends, bufts, size, stager)) {
+ }
+ 
+ llama_moe_cache::~llama_moe_cache() = default;
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 3b6726b86..d86ff562e 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -7,13 +7,16 @@
+ #include <vector>
+ 
+ struct llama_model;
++class llama_host_stager;
+ 
+ // keeps the most recently used experts of host-resident MoE layers in a device buffer
+ // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
+ class llama_moe_cache {
+ public:
+     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
+-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
++    // stager: pinned staging for the uploads of the missing experts, nullptr for plain copies
++    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
++            llama_host_stager * stager = nullptr);
+     ~llama_moe_cache();
+ 
+     // the device that caches layer il

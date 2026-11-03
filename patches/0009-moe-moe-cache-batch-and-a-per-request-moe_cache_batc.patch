@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Tue, 3 Nov 2026 09:38:00 -0500
+Subject: [PATCH 9/9] moe: --moe-cache-batch and a per-request moe_cache_batch
+ for the server
+
+The largest ubatch the MoE cache serves was a constant (32 tokens): bigger
+prompts stage every expert of every layer through the GPU, a scan of the
+whole expert pool. The limit is now a context parameter with a setter, a
+server flag, and a request field, so a client that knows a short prompt
+starts long work (an agent turn, a coding task) can raise it and keep the
+cache warm, while a document dump still takes the staged path.
+---
+ common/arg.cpp                  | 10 ++++++++++
+ common/common.cpp               |  1 +
+ common/common.h                 |  1 +
+ include/llama.h                 |  4 ++++
+ src/llama-context.cpp           | 22 ++++++++++++++++++++++
+ src/llama-context.h             |  1 +
+ src/llama-cparams.h             |  1 +
+ src/llama-moe-cache.cpp         |  6 +++++-
+ src/llama-moe-cache.h           |  3 +++
+ tools/server/server-context.cpp |  4 ++++
+ tools/server/server-schema.cpp  |  4 ++++
+ tools/server/server-task.cpp    |  2 ++
+ tools/server/server-task.h      |  2 ++
+ 13 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 49c81565c..68fd17cb3 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2814,6 +2814,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.moe_ram_size = (size_t) value*1024*1024;
+         }
+     ).set_env("LLAMA_ARG_MOE_RAM_MIB"));
++    add_opt(common_arg(
++        {"--moe-cache-batch"}, "N",
++        "largest prompt batch in tokens served by the MoE cache; larger batches stage every expert of a layer through the GPU instead, which reads the whole expert pool (default: 32). a request can override it with moe_cache_batch",
++        [](common_params & params, int value) {
++            if (value < 1) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.moe_cache_batch = value;
++        }
++    ).set_env("LLAMA_ARG_MOE_CACHE_BATCH"));
+     add_opt(common_arg(
+         {"-ncffn", "--n-cpu-ffn"}, "N",
+         "keep the dense FFN weights of the first N layers in the CPU\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index 47136623d..ef14b06a8 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1748,6 +1748,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.moe_stage_size = params.moe_stage_size;
+     cparams.moe_profile    = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
+     cparams.moe_ram_size   = params.moe_ram_size;
++    cparams.moe_cache_batch = params.moe_cache_batch;
+ 
+     return cparams;
+ }
+diff --git a/common/common.h b/common/common.h
+index 12cec85a5..b08dda158 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -599,6 +599,7 @@ struct common_params {
+     size_t moe_stage_size = 128u*1024*1024; // pinned staging bytes per buffer (two per GPU) for the uploads of the experts kept in the CPU
+     std::string moe_profile; // path of the expert use profile kept across runs (empty = none)
+     size_t moe_ram_size = 0; // bytes of the MoE experts kept in the CPU to lock in RAM, the most used first when a profile exists
++    int32_t moe_cache_batch = 32; // largest prompt batch (tokens) served by the MoE cache, larger ones stage a layer's experts instead
+ 
+     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index f7580e4c0..4d7836e26 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -400,6 +400,7 @@ extern "C" {
+         size_t moe_stage_size; // pinned staging bytes per buffer (two per device) for the uploads of host experts, 0 = unstaged copies [EXPERIMENTAL]
+         const char * moe_profile; // path of the expert use profile: read to seed the MoE cache, written as the experts are routed, NULL = none [EXPERIMENTAL]
+         size_t moe_ram_size; // bytes of host experts locked in RAM at creation, the most used first when a profile exists, 0 = none [EXPERIMENTAL]
++        int32_t moe_cache_batch; // largest ubatch (tokens) the MoE cache serves, larger ones stage the experts of a layer instead (default 32) [EXPERIMENTAL]
+ 
+         // Abort callback
+         // if it returns true, execution of llama_decode() will be aborted
+@@ -1116,6 +1117,9 @@ extern "C" {
+     // If set to true, the model will only attend to the past tokens
+     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+ 
++    // Set the largest ubatch the MoE cache serves (see llama_context_params.moe_cache_batch), for the next decodes
++    LLAMA_API void llama_set_moe_cache_batch(struct llama_context * ctx, int32_t n_tokens);
++
+     // Returns whether the context is currently using causal attention
+     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8da2e3bdc..853ac0ae2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -362,6 +362,7 @@ llama_context::llama_context(
+     cparams.moe_cache_size = params.moe_cache_size;
+     cparams.moe_stage_size = params.moe_stage_size;
+     cparams.moe_ram_size   = params.moe_ram_size;
++    cparams.moe_cache_batch = std::max<int32_t>(1, params.moe_cache_batch);
+ 
+     // initialized later
+     cparams.pipeline_parallel = false;
+@@ -563,6 +564,7 @@ llama_context::llama_context(
+         if (cparams.moe_cache_size > 0) {
+             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, host_stager.get(),
+                 params.moe_profile != nullptr && params.moe_profile[0] != 0 ? &moe_profile : nullptr, params.moe_profile);
++            moe_cache->set_max_batch(cparams.moe_cache_batch);
+         }
+ 
+         // the RAM tier below the device cache: the experts the cache does not hold, the most used first
+@@ -1351,6 +1353,21 @@ void llama_context::set_embeddings(bool value) {
+     cparams.embeddings = value;
+ }
+ 
++void llama_context::set_moe_cache_batch(int32_t n_tokens) {
++    n_tokens = std::max<int32_t>(1, n_tokens);
++    if (cparams.moe_cache_batch == n_tokens) {
++        return;
++    }
++    LLAMA_LOG_DEBUG("%s: n_tokens = %d\n", __func__, n_tokens);
++
++    cparams.moe_cache_batch = n_tokens;
++    if (moe_cache) {
++        moe_cache->set_max_batch(n_tokens);
++        // the limit decides whether a ubatch reads the slot maps, so a kept graph may be the wrong shape
++        gf_res_prev_active = nullptr;
++    }
++}
++
+ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
+ 
+@@ -4055,6 +4072,7 @@ llama_context_params llama_context_default_params() {
+         /*.moe_stage_size              =*/ 128u*1024*1024,
+         /*.moe_profile                 =*/ nullptr,
+         /*.moe_ram_size                =*/ 0,
++        /*.moe_cache_batch             =*/ 32,
+         /*.abort_callback              =*/ nullptr,
+         /*.abort_callback_data         =*/ nullptr,
+         /*.embeddings                  =*/ false,
+@@ -4256,6 +4274,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+     ctx->set_causal_attn(causal_attn);
+ }
+ 
++void llama_set_moe_cache_batch(llama_context * ctx, int32_t n_tokens) {
++    ctx->set_moe_cache_batch(n_tokens);
++}
++
+ bool llama_get_causal_attn(const llama_context * ctx) {
+     return ctx->get_causal_attn();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 763831640..63199b02f 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -120,6 +120,7 @@ struct llama_context {
+     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+ 
+     void set_embeddings (bool value);
++    void set_moe_cache_batch(int32_t n_tokens);
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index c160c8d8e..c2969589e 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -58,6 +58,7 @@ struct llama_cparams {
+     size_t moe_cache_size;
+     size_t moe_stage_size;
+     size_t moe_ram_size;
++    int32_t moe_cache_batch;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 1fc8eb8f8..a3c35350d 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -195,7 +195,7 @@ struct llama_moe_cache::impl {
+         size_t bytes  = 0;
+     };
+ 
+-    static constexpr int64_t max_batch = 32;
++    int64_t max_batch = 32;
+ 
+     int32_t n_expert_used;
+ 
+@@ -763,6 +763,10 @@ bool llama_moe_cache::is_cached(int32_t il, int32_t e) const {
+     return pimpl->is_cached(il, e);
+ }
+ 
++void llama_moe_cache::set_max_batch(int64_t n_tokens) {
++    pimpl->max_batch = std::max<int64_t>(1, n_tokens);
++}
++
+ void llama_moe_cache::note_used(const ggml_tensor * w, const int32_t * ids, size_t n_ids) {
+     pimpl->note_used(w, ids, n_ids);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 95cec927e..4d68dab87 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -34,6 +34,9 @@ public:
+     // true if expert e of layer il is in the cache now
+     bool is_cached(int32_t il, int32_t e) const;
+ 
++    // the largest ubatch served from the cache; larger ones stage a layer's experts and leave the cache as it is
++    void set_max_batch(int64_t n_tokens);
++
+     // count the routing of ids to the experts of w for the profile (the large batches the cache does not serve)
+     void note_used(const ggml_tensor * w, const int32_t * ids, size_t n_ids);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a18b7542c..5ba378c52 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3324,6 +3324,10 @@ private:
+             }
+ 
+             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
++
++            // the request may size the prompt batches the MoE cache serves
++            const int32_t moe_cache_batch = slot_batched->task ? slot_batched->task->params.moe_cache_batch : -1;
++            llama_set_moe_cache_batch(ctx_tgt, moe_cache_batch >= 0 ? moe_cache_batch : params_base.moe_cache_batch);
+         }
+ 
+         int32_t off_next = 0;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 54e126aa0..17c65f636 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -68,6 +68,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+         ->set_hard_limits(0, INT32_MAX)
+         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
+ 
++    add((new field_num("moe_cache_batch", params.moe_cache_batch))
++        ->set_hard_limits(-1, INT32_MAX)
++        ->set_desc("Largest prompt batch in tokens served by the MoE cache for this request; larger batches stage every expert of a layer instead. -1 keeps the server's --moe-cache-batch. A client that knows a short prompt starts long work can raise it to keep the cache warm"));
++
+     // TODO: implement t_max_prompt_ms
+     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 3f30da2cd..e207d1b2e 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -69,6 +69,7 @@ json task_params::to_json(bool only_metrics) const {
+             {"n_predict",                 n_predict}, // TODO: deduplicate?
+             {"n_keep",                    n_keep},
+             {"n_discard",                 n_discard},
++            {"moe_cache_batch",           moe_cache_batch},
+             {"ignore_eos",                sampling.ignore_eos},
+             {"stream",                    stream},
+             {"n_probs",                   sampling.n_probs},
+@@ -123,6 +124,7 @@ json task_params::to_json(bool only_metrics) const {
+         {"n_predict",                 n_predict}, // TODO: deduplicate?
+         {"n_keep",                    n_keep},
+         {"n_discard",                 n_discard},
++        {"moe_cache_batch",           moe_cache_batch},
+         {"ignore_eos",                sampling.ignore_eos},
+         {"stream",                    stream},
+         {"logit_bias",                format_logit_bias(sampling.logit_bias)},
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index e7bb04398..e9ae39f94 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -65,6 +65,8 @@ struct task_params {
+ 
+     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
+ 
++    int32_t moe_cache_batch = -1; // largest prompt batch served by the MoE cache for this request, -1 = the server's --moe-cache-batch
++
+     int64_t t_max_prompt_ms  = -1; // TODO: implement
+     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
+ 

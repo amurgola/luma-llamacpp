@@ -22,6 +22,11 @@ load-to-healthy time**. The patches here target it.
 | 0002 | Async pinned-staging uploads + parallel prefault for mmap-sourced weights | upstream candidate |
 | 0003 | Overlap vocab construction with tensor loading (`n_vocab` and `n_token_types` pre-read from gguf metadata) — hides ~1.9s of 250k-vocab build behind the weight upload | upstream candidate |
 | 0004 | Dual-threaded mmap staging copies | upstream candidate |
+| 0005 | DeepSeek-V4.1-Flash (`deepseek41`) with unsloth's MXFP8 Engram table: ggml-org/llama.cpp#30817 verbatim (danielhanchen:deepseek41, b72050d03 on b11716) | upstream PR, open |
+| 0006 | `llama_host_stager`: pinned, multi-threaded staging for every upload of a host-resident MoE expert (the MoE cache's misses and the staged prompt batches), with low memory priority for prompt scans so they stop evicting the experts generation hits (`--moe-stage-mib`, default 128) | upstream candidate |
+| 0007 | `--moe-profile PATH`: expert use counts kept across runs; the next run seeds the MoE cache with the most used experts before the first token, and cache stats are logged every 4096 slot-map copies | upstream candidate |
+| 0008 | `--moe-ram-mib N`: a locked RAM tier of host experts under the device cache (VirtualLock / mlock after a ranged prefetch, most used first with a profile) | upstream candidate |
+| 0009 | `--moe-cache-batch N` plus the per-request `moe_cache_batch` field: the largest prompt batch served by the MoE cache is no longer a constant 32 | upstream candidate |
 
 Landed upstream and dropped from the stack:
 
@@ -35,6 +40,29 @@ Measured together on a 21.5 GiB Q6_K model (warm page cache, RTX 5090, Windows
 weight-upload phase alone going ~6.7s → ~2.2s (~3.2 → ~9.8 GB/s). mmap becomes
 the fastest load mode while keeping its zero-copy RAM profile — which is
 exactly what a RAM-pinned model wants.
+
+## Expert tiers (0006 to 0009)
+
+For a MoE model whose experts stay in host memory (`--cpu-moe` plus
+`--moe-cache-mib`), upstream has two tiers that know nothing about each other:
+a small LRU of experts on the GPU and the OS page cache under the mapping. Every
+upload of an expert is a synchronous driver copy that soft-faults the mapping
+one page at a time on one thread, and every prompt batch above 32 tokens stages
+all the experts of every layer through the GPU, so on a model bigger than RAM
+(DeepSeek-V4.1-Flash: 289 GB of experts on a 190 GB box) a 40-token chat turn
+took about 50 s and flushed the experts generation had warmed. The four
+patches turn that into tiers the app can size:
+
+- GPU cache (upstream), seeded from the profile before the first token;
+- locked RAM (`--moe-ram-mib`): the next most used experts, which neither a
+  prompt scan nor another process can page out;
+- page cache, then the SSD, read through pinned staging buffers by several
+  threads with the reads of a whole layer in flight at once; prompt scans
+  read at low memory priority so the OS evicts their pages first.
+
+`--moe-cache-batch` and the request field `moe_cache_batch` decide which
+prompts read the cache instead of scanning the pool; LumaBrowser raises it for
+turns it knows start long work (its agent runs with code and artifact tools).
 
 ## Layout
 
