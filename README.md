@@ -64,6 +64,19 @@ patches turn that into tiers the app can size:
 prompts read the cache instead of scanning the pool; LumaBrowser raises it for
 turns it knows start long work (its agent runs with code and artifact tools).
 
+Measured 2026-11-03 on DeepSeek-V4.1-Flash-1017 UD-Q4_K_XL (500 GB, 289 GB of
+experts) on an RTX 5090 with 190 GB of RAM, b11721 plus this stack, chat mode,
+32k context, a 10.6 GB MoE cache (LumaBrowser's own plan; the base row is the
+same binary with `--moe-stage-mib 0`, which is upstream's upload path):
+
+| variant | decode tok/s | 4k prompt | 40-token chat prompt | decode at 4k depth |
+|---|---|---|---|---|
+| base (upstream path) | 1.6 to 2.3 | 263 s | 53 to 87 s | 0.77 |
+| 0006 stager | 2.5 to 2.8 | 68 s | 16 to 21 s | 1.92 |
+| 0006 + 0008 RAM tier (96 GB locked) | 2.9 to 3.3 | 50 s | 16 to 23 s | 2.02 |
+| above + 0007 profile seeded (2nd run) | 3.3 to 3.4 | 39 s | 11 to 17 s | 2.71 |
+| above + 0009 `--moe-cache-batch 128` (3rd run) | 3.3 to 3.6 | 36 s | 6 to 15 s | 2.46 |
+
 ## Layout
 
 ```
