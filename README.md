@@ -27,6 +27,7 @@ load-to-healthy time**. The patches here target it.
 | 0007 | `--moe-profile PATH`: expert use counts kept across runs; the next run seeds the MoE cache with the most used experts before the first token, and cache stats are logged every 4096 slot-map copies | upstream candidate |
 | 0008 | `--moe-ram-mib N`: a locked RAM tier of host experts under the device cache (VirtualLock / mlock after a ranged prefetch, most used first with a profile) | upstream candidate |
 | 0009 | `--moe-cache-batch N` plus the per-request `moe_cache_batch` field: the largest prompt batch served by the MoE cache is no longer a constant 32 | upstream candidate |
+| 0010 | `--moe-ram-register-mib N`: the RAM tier is registered with the GPU (most used experts first, default 40% of RAM), so cache misses that live there upload by DMA straight from the mapping at the link's speed instead of through the staging copy | upstream candidate |
 
 Landed upstream and dropped from the stack:
 
@@ -41,7 +42,7 @@ weight-upload phase alone going ~6.7s → ~2.2s (~3.2 → ~9.8 GB/s). mmap becom
 the fastest load mode while keeping its zero-copy RAM profile — which is
 exactly what a RAM-pinned model wants.
 
-## Expert tiers (0006 to 0009)
+## Expert tiers (0006 to 0010)
 
 For a MoE model whose experts stay in host memory (`--cpu-moe` plus
 `--moe-cache-mib`), upstream has two tiers that know nothing about each other:
@@ -55,7 +56,10 @@ patches turn that into tiers the app can size:
 
 - GPU cache (upstream), seeded from the profile before the first token;
 - locked RAM (`--moe-ram-mib`): the next most used experts, which neither a
-  prompt scan nor another process can page out;
+  prompt scan nor another process can page out; its most used part is also
+  registered with the GPU (`--moe-ram-register-mib`, 0010), so a miss that
+  lives there is one DMA at the link's speed (47 GB/s measured on PCIe 5.0 x16)
+  rather than a copy through pinned staging (16 GB/s, bounded by the memcpy);
 - page cache, then the SSD, read through pinned staging buffers by several
   threads with the reads of a whole layer in flight at once; prompt scans
   read at low memory priority so the OS evicts their pages first.
@@ -76,6 +80,27 @@ same binary with `--moe-stage-mib 0`, which is upstream's upload path):
 | 0006 + 0008 RAM tier (96 GB locked) | 2.9 to 3.3 | 50 s | 16 to 23 s | 2.02 |
 | above + 0007 profile seeded (2nd run) | 3.3 to 3.4 | 39 s | 11 to 17 s | 2.71 |
 | above + 0009 `--moe-cache-batch 128` (3rd run) | 3.3 to 3.6 | 36 s | 6 to 15 s | 2.46 |
+| above, rerun on the 0010 build with registration off | 3.3 to 3.4 | 30 s | 11 to 21 s | 2.56 |
+| above + 0010 registered tier (76 GB of the 96 GB) | 5.3 to 6.0 | 32 s | 7 to 21 s | 3.83 |
+
+The 0010 budget matters: on Windows the display driver maps host registrations
+into the GPU's shared system memory, and past about half of physical RAM it
+backs each further GiB with device memory until the card is full (measured:
+free up to 100 GiB on a 190 GB box, then 20 GB of VRAM gone by 120 GiB). The
+default registers 40% of RAM, most used experts first; the rest of the tier
+stays locked and uploads through the stager.
+
+An experiment on the same model (ten coding prompts and ten page-extraction
+prompts, each run on a fresh profile, then the extraction prompts with the
+cache seeded from the code profile, from a mixed profile and from their own)
+found that seeding the GPU cache makes no measurable difference: every run
+settled at a 42 to 45% decode hit rate from its first hundred tokens, because
+a prompt of a few hundred tokens through the cache path routes to most experts
+of every layer and flushes the 600-slot cache many times over before the first
+generated token. The LRU alone reaches that rate. The profiles themselves do
+differ (the two domains share 31% of their top 600 experts, and each covers
+87% of its own routings at the RAM tier against 60% for the other), and that
+ordering of the RAM tier is where the profile earns its decode gain.
 
 ## Layout
 
