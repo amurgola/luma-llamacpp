@@ -28,6 +28,7 @@ load-to-healthy time**. The patches here target it.
 | 0008 | `--moe-ram-mib N`: a locked RAM tier of host experts under the device cache (VirtualLock / mlock after a ranged prefetch, most used first with a profile) | upstream candidate |
 | 0009 | `--moe-cache-batch N` plus the per-request `moe_cache_batch` field: the largest prompt batch served by the MoE cache is no longer a constant 32 | upstream candidate |
 | 0010 | `--moe-ram-register-mib N`: the RAM tier is registered with the GPU (most used experts first, default 40% of RAM), so cache misses that live there upload by DMA straight from the mapping at the link's speed instead of through the staging copy | upstream candidate |
+| 0011 | `ricursive` architecture: ricursiveAI Ripple-65B-Preview (dense 65B, PeriNorm blocks, gated attention, value residual, clamped SwiGLU, 4:1 sliding-window/no-RoPE hybrid attention) with its HF converter; no upstream support yet | upstream candidate |
 
 Landed upstream and dropped from the stack:
 
