@@ -32,6 +32,20 @@ $vcvars = Join-Path $vsroot 'VC\Auxiliary\Build\vcvars64.bat'
 # STATUS_DLL_NOT_FOUND (0xC0000135). LumaBrowser never uses the server's
 # HTTPS downloader, so nothing is lost.
 $nvcc = Join-Path $CudaPath 'bin\nvcc.exe'
+
+# The server embeds upstream's prebuilt web UI, fetched by build number. The
+# patched tree's number (the pin plus the patches) is not an upstream build
+# unless one happens to exist, and the fallback to 'latest' is a UI the pinned
+# sources can reject ("missing required asset": luma-b8, 12 patches on b11721).
+# Ask for the UI of the pinned commit itself. A shallow clone miscounts and
+# falls back to 'latest' as before.
+if (-not $env:HF_UI_VERSION) {
+  $pin = (Get-Content (Join-Path $root 'UPSTREAM_REF') | Select-Object -First 1).Trim()
+  $pinBuild = git -C $work rev-list --count $pin
+  if ($LASTEXITCODE -eq 0 -and $pinBuild) { $env:HF_UI_VERSION = "b$pinBuild" }
+}
+Write-Host "web UI assets: $env:HF_UI_VERSION"
+
 cmd /c "call `"$vcvars`" >nul && cmake -S `"$work`" -B `"$work\build`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=`"$Archs`" -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DCMAKE_CUDA_COMPILER=`"$nvcc`" && ninja -C `"$work\build`" llama-server"
 if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
