@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Wed, 18 Nov 2026 23:03:57 -0500
+Subject: [PATCH] moe: stage mapped experts only, cut unstaged uploads at
+ registered edges
+
+The host stager copied every upload of a host expert through its pinned
+buffers, also when the experts had been read into an allocated buffer
+(no mmap). Nothing faults there and the buffer is pinned when the backend
+offers pinned host memory, so the copy only cost time: generation on a
+97 GiB expert pool (Qwen3.8-Flash-Next, RTX 5090) ran at 36 tok/s against
+63 with --moe-stage-mib 0. The stager is now created only when an expert
+tensor lives in a mapping (llama_model::is_mapped).
+
+Without the stager, an upload next to a registered range of the RAM tier
+(--moe-ram-register-mib) died in the first decode with a CUDA 'invalid
+argument': the ranges are page-rounded, so a neighbouring expert shares
+its first or last page with one, and the driver refuses a copy that
+straddles the edge of a registration. llama_moe_host_registry::upload
+cuts unstaged copies at the edges; the cache misses, the seed and the
+large batches go through it.
+---
+ common/arg.cpp            |  2 +-
+ src/llama-context.cpp     |  4 ++--
+ src/llama-host-stager.cpp |  6 +++---
+ src/llama-host-stager.h   | 18 +++++++++++-------
+ src/llama-model.cpp       | 10 ++++++++++
+ src/llama-model.h         |  4 ++++
+ src/llama-moe-cache.cpp   | 13 +++++++++++--
+ src/llama-moe-profile.cpp | 21 +++++++++++++++++++++
+ src/llama-moe-profile.h   |  5 +++++
+ 9 files changed, 68 insertions(+), 15 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 947482edc..c7a82f7e5 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2789,7 +2789,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+     add_opt(common_arg(
+         {"--moe-stage-mib"}, "N",
+-        "pinned staging buffer size in MiB (two per GPU) for the uploads of the MoE experts kept in the CPU: several threads copy the experts into pinned memory and the GPU reads it asynchronously (default: 128, 0 = plain copies)",
++        "pinned staging buffer size in MiB (two per GPU) for the uploads of the memory-mapped MoE experts kept in the CPU: several threads copy the experts into pinned memory and the GPU reads it asynchronously; experts loaded without mmap are never staged (default: 128, 0 = plain copies)",
+         [](common_params & params, int value) {
+             if (value < 0) {
+                 throw std::invalid_argument("invalid value");
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8ff0b3d09..f85743d55 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -562,7 +562,7 @@ llama_context::llama_context(
+             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+         }
+ 
+-        if (cparams.moe_stage_size > 0 && llama_host_stager::model_has_host_experts(model)) {
++        if (cparams.moe_stage_size > 0 && llama_host_stager::model_has_mapped_host_experts(model)) {
+             const int n_copy_threads = std::max(2, std::min(8, (int) std::thread::hardware_concurrency()/2));
+             host_stager = std::make_unique<llama_host_stager>(backend_ptrs, cparams.moe_stage_size, n_copy_threads);
+         }
+@@ -2847,7 +2847,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         if (staged) {
+             st.reqs.push_back({ dst, offset, (const uint8_t *) src->data + offset, size });
+         } else {
+-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
++            lctx->moe_host_registry.upload(backend, dst, offset, (const uint8_t *) src->data + offset, size);
+         }
+     };
+ 
+diff --git a/src/llama-host-stager.cpp b/src/llama-host-stager.cpp
+index aac761a38..03f636617 100644
+--- a/src/llama-host-stager.cpp
++++ b/src/llama-host-stager.cpp
+@@ -368,12 +368,12 @@ struct llama_host_stager::impl {
+     }
+ };
+ 
+-bool llama_host_stager::model_has_host_experts(const llama_model & model) {
++bool llama_host_stager::model_has_mapped_host_experts(const llama_model & model) {
+     for (const auto & layer : model.layers) {
+         for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+-            if (t != nullptr && t->buffer != nullptr &&
++            if (t != nullptr && t->buffer != nullptr && t->data != nullptr &&
+                     ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-                    ggml_backend_buffer_is_host(t->buffer)) {
++                    ggml_backend_buffer_is_host(t->buffer) && model.is_mapped(t->data)) {
+                 return true;
+             }
+         }
+diff --git a/src/llama-host-stager.h b/src/llama-host-stager.h
+index 7f5b807dd..d8e4a1bba 100644
+--- a/src/llama-host-stager.h
++++ b/src/llama-host-stager.h
+@@ -10,12 +10,15 @@
+ 
+ struct llama_model;
+ 
+-// Uploads bytes of host weights to a device through pinned staging buffers.
++// Uploads bytes of memory-mapped host weights to a device through pinned staging buffers.
+ //
+-// The experts kept in host memory are memory-mapped and pageable, so a plain upload is a synchronous copy by the
+-// driver that soft-faults the mapping one page at a time on one thread (2 to 3 GB/s, less when the pages come from
+-// the disk). Here several threads copy the source into a pinned buffer, the faults scale with the threads, and the
+-// device reads the pinned buffer asynchronously while the threads fill the other buffer.
++// Experts kept in a mapping are pageable, so a plain upload is a synchronous copy by the driver that soft-faults the
++// mapping one page at a time on one thread (2 to 3 GB/s, less when the pages come from the disk). Here several
++// threads copy the source into a pinned buffer, the faults scale with the threads, and the device reads the pinned
++// buffer asynchronously while the threads fill the other buffer.
++//
++// Experts read into an allocated buffer (no mmap) are not staged: nothing faults there, the buffer is pinned when the
++// backend offers pinned host memory, and the extra copy halved generation on a 97 GiB pool (36 against 63 tok/s).
+ //
+ // The pages touched for a large batch are marked as the first to evict: a prompt reads every expert of a layer, and
+ // without that mark the scan pushes the experts that generation keeps hitting out of the page cache.
+@@ -28,8 +31,9 @@ public:
+         size_t        size;
+     };
+ 
+-    // true if any expert tensor of the model lives in host memory, the only weights re-uploaded at run time
+-    static bool model_has_host_experts(const llama_model & model);
++    // true if any expert tensor of the model lives in a host mapping: the weights re-uploaded at run time whose
++    // pages can fault
++    static bool model_has_mapped_host_experts(const llama_model & model);
+ 
+     // one pair of pinned buffers of buffer_size bytes per GPU backend that offers pinned memory
+     llama_host_stager(const std::vector<ggml_backend_t> & backends, size_t buffer_size, int n_threads);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b2e48e006..03867ea46 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2407,6 +2407,16 @@ size_t llama_model::size() const {
+     return pimpl->n_bytes;
+ }
+ 
++bool llama_model::is_mapped(const void * p) const {
++    for (const auto & mapping : pimpl->mappings) {
++        const uint8_t * addr = (const uint8_t *) mapping->addr();
++        if ((const uint8_t *) p >= addr && (const uint8_t *) p < addr + mapping->size()) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ size_t llama_model::n_tensors() const {
+     return tensors_by_name.size();
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index bd935be2c..025ac3f95 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -903,6 +903,10 @@ struct llama_model {
+ 
+     bool has_tensor_overrides() const;
+ 
++    // true if the byte at p is in a memory-mapped model file (pageable, backed by the page cache), false if the
++    // weight was read into an allocated buffer
++    bool is_mapped(const void * p) const;
++
+     const struct ggml_tensor * get_tensor(const char * name) const;
+ 
+     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 5981fb9ce..0fb410ac6 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -528,7 +528,7 @@ struct llama_moe_cache::impl {
+                         if (staged) {
+                             reqs.push_back({ bank, f.slot*expert_size, (const uint8_t *) w->data + f.expert*expert_size, expert_size });
+                         } else {
+-                            ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + f.expert*expert_size, f.slot*expert_size, expert_size);
++                            upload_direct(backend, bank, f.slot*expert_size, (const uint8_t *) w->data + f.expert*expert_size, expert_size);
+                         }
+                         bytes += expert_size;
+                     }
+@@ -545,6 +545,15 @@ struct llama_moe_cache::impl {
+             n_seeded, bytes/1024.0/1024.0/1024.0, (ggml_time_us() - t_start)/1e6);
+     }
+ 
++    // an upload that is not staged; with a registered RAM tier it is cut at the edges of the registered ranges
++    void upload_direct(ggml_backend_t backend, ggml_tensor * dst, size_t dst_offset, const uint8_t * src, size_t size) const {
++        if (registry != nullptr) {
++            registry->upload(backend, dst, dst_offset, src, size);
++        } else {
++            ggml_backend_tensor_set_async(backend, dst, src, dst_offset, size);
++        }
++    }
++
+     bool is_cached(int32_t il, int32_t e) const {
+         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+             return false;
+@@ -704,7 +713,7 @@ struct llama_moe_cache::impl {
+                 if (staged && !registered) {
+                     reqs.push_back({ bank, fills[i].slot*expert_size, src_data, n*expert_size });
+                 } else {
+-                    ggml_backend_tensor_set_async(backend, bank, src_data, fills[i].slot*expert_size, n*expert_size);
++                    upload_direct(backend, bank, fills[i].slot*expert_size, src_data, n*expert_size);
+                     direct += registered ? n*expert_size : 0;
+                 }
+                 bytes += n*expert_size;
+diff --git a/src/llama-moe-profile.cpp b/src/llama-moe-profile.cpp
+index 1540d8e47..34a82f524 100644
+--- a/src/llama-moe-profile.cpp
++++ b/src/llama-moe-profile.cpp
+@@ -92,6 +92,27 @@ bool llama_moe_host_registry::contains(const void * p, size_t n) const {
+     return begin >= it->begin && end <= it->end;
+ }
+ 
++void llama_moe_host_registry::upload(ggml_backend_t backend, ggml_tensor * dst, size_t dst_offset, const void * src, size_t size) const {
++    const uintptr_t first = (uintptr_t) src;
++    const uintptr_t last  = first + size;
++
++    // the first range that ends past the start of the copy
++    auto it = std::upper_bound(ranges.begin(), ranges.end(), first, [](uintptr_t b, const range & r) { return b < r.end; });
++    for (uintptr_t cur = first; cur < last;) {
++        uintptr_t stop = last;
++        if (it != ranges.end()) {
++            if (cur < it->begin) {
++                stop = std::min(last, it->begin);
++            } else {
++                stop = std::min(last, it->end);
++                ++it;
++            }
++        }
++        ggml_backend_tensor_set_async(backend, dst, (const void *) cur, dst_offset + (cur - first), stop - cur);
++        cur = stop;
++    }
++}
++
+ size_t llama_moe_host_registry::bytes() const {
+     size_t n = 0;
+     for (const range & r : ranges) {
+diff --git a/src/llama-moe-profile.h b/src/llama-moe-profile.h
+index adf280f7f..743acf91b 100644
+--- a/src/llama-moe-profile.h
++++ b/src/llama-moe-profile.h
+@@ -59,6 +59,11 @@ struct llama_moe_host_registry {
+     // true if [p, p + n) lies in one registered range
+     bool contains(const void * p, size_t n) const;
+ 
++    // upload size host bytes at src to dst without staging. The driver refuses a copy that straddles the edge of a
++    // registered range ("invalid argument"), and the ranges are page-rounded, so an expert next to one shares its
++    // first or last page with it: the copy is cut at the edges
++    void upload(ggml_backend_t backend, ggml_tensor * dst, size_t dst_offset, const void * src, size_t size) const;
++
+     size_t bytes() const;
+ 
+     // unregisters every range

@@ -29,6 +29,7 @@ load-to-healthy time**. The patches here target it.
 | 0009 | `--moe-cache-batch N` plus the per-request `moe_cache_batch` field: the largest prompt batch served by the MoE cache is no longer a constant 32 | upstream candidate |
 | 0010 | `--moe-ram-register-mib N`: the RAM tier is registered with the GPU (most used experts first, default 40% of RAM), so cache misses that live there upload by DMA straight from the mapping at the link's speed instead of through the staging copy | upstream candidate |
 | 0011 | `ricursive` architecture: ricursiveAI Ripple-65B-Preview (dense 65B, PeriNorm blocks, gated attention, value residual, clamped SwiGLU, 4:1 sliding-window/no-RoPE hybrid attention) with its HF converter; no upstream support yet | upstream candidate |
+| 0012 | The staging copy of 0006 serves memory-mapped experts only: experts read into RAM without mmap upload directly, as upstream does (the copy halved generation on a pool that fits RAM). Unstaged uploads are cut at the edges of the registered RAM tier, so `--moe-stage-mib 0` with `--moe-ram-register-mib` no longer dies in the first decode with a CUDA "invalid argument" | upstream candidate |
 
 Landed upstream and dropped from the stack:
 
@@ -90,6 +91,24 @@ backs each further GiB with device memory until the card is full (measured:
 free up to 100 GiB on a 190 GB box, then 20 GB of VRAM gone by 120 GiB). The
 default registers 40% of RAM, most used experts first; the rest of the tier
 stays locked and uploads through the stager.
+
+The staging copy pays off when the expert pages come from the disk. On a pool that
+fits RAM it only costs time, and 0012 stops staging experts that were read into an
+allocated buffer (`--load-mode none`). Measured 2026-11-18 on Qwen3.8-Flash-Next
+UD-Q4_K_XL (104 GB, a 97 GiB expert pool) on an RTX 5090, 32k context, an 18 GB MoE
+cache, default `--moe-stage-mib`, same session:
+
+| build | decode tok/s | 4k prompt tok/s | decode at 4k depth |
+|---|---|---|---|
+| luma-b7 | 33 to 34 | 564 | 19 |
+| luma-b8 (0012) | 53 to 56 | 1186 | 39 |
+
+luma-b7 with `--moe-stage-mib 0` ran at 53 to 58 in the same session. For a mapped
+pool that sits in RAM the copy still costs (31 against 37 tok/s on luma-b7), and
+the stager cannot tell resident pages from pages on the disk, so LumaBrowser
+passes `--moe-stage-mib 0` there. With that flag and a registered tier
+(`--moe-ram-mib 97000 --moe-ram-register-mib 38833`) luma-b7 died in the first
+decode; luma-b8 runs it at 45 to 46 tok/s.
 
 An experiment on the same model (ten coding prompts and ten page-extraction
 prompts, each run on a fresh profile, then the extraction prompts with the
